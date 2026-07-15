@@ -227,9 +227,9 @@ else if (pct < -10)  flag = "Too Cheap";
 
 ## 👤 Author
 
-**Nitin** — ECE @ NSUT Delhi (2026) · Data Analytics · Product Management · AI/Gen AI
+**vanisha Rathore** — ECE @ NSUT Delhi (2027) · Data Analytics · Product Management · AI/Gen AI
 
-- GitHub: [@notnottynitin](https://github.com/notnottynitin)
+- GitHub: (https://github.com/vanishar9880)
 - Open to: Data Analyst · Product Analyst · BA · AI/Gen AI Intern roles
 
 ---
