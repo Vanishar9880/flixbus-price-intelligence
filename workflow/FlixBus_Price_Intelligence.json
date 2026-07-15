@@ -1,0 +1,353 @@
+{
+  "name": "FlixBus Price Intelligence — Daily",
+  "nodes": [
+    {
+      "id": "node-01",
+      "name": "Daily Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 380],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-02",
+      "name": "Fetch Sheet Data",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.2,
+      "position": [460, 380],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1"
+        },
+        "options": {
+          "headerRow": 1
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "node-03",
+      "name": "Clean Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 380],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cleaned = [];\n\nfor (const item of items) {\n  const row = item.json;\n\n  // Drop rows where Weighted Average Price is missing\n  const wap = parseFloat(row[\"Weighted Average Price\"]);\n  if (!row[\"Weighted Average Price\"] || isNaN(wap)) continue;\n\n  // Fill missing Number of Reviews with 0\n  const reviewsRaw = row[\"Number of Reviews\"];\n  const reviews = (reviewsRaw !== undefined && reviewsRaw !== \"\")\n    ? parseInt(reviewsRaw, 10)\n    : 0;\n\n  cleaned.push({\n    json: {\n      ...row,\n      \"Weighted Average Price\": wap,\n      \"Number of Reviews\": isNaN(reviews) ? 0 : reviews,\n      \"SRP Rank\":        parseFloat(row[\"SRP Rank\"]) || 0,\n      \"Available Seats\": parseInt(row[\"Available Seats\"], 10) || 0,\n      \"Total Seats\":     parseInt(row[\"Total Seats\"], 10) || 1,\n      \"Bus Score\":       parseFloat(row[\"Bus Score\"]) || 0\n    }\n  });\n}\n\nreturn cleaned;"
+      }
+    },
+    {
+      "id": "node-04",
+      "name": "Derive Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 380],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return items.map(item => {\n  const row = item.json;\n\n  // Load Factor = 1 - (Available Seats / Total Seats)\n  const loadFactor = parseFloat(\n    (1 - (row[\"Available Seats\"] / row[\"Total Seats\"])).toFixed(4)\n  );\n\n  // Departure Hour from \"HH:MM\" string or ISO timestamp\n  const depStr = String(row[\"Departure Time\"] || \"\");\n  let departureHour = 0;\n  if (depStr.includes(\":\") && !depStr.includes(\"T\")) {\n    departureHour = parseInt(depStr.split(\":\")[0], 10);\n  } else if (depStr.includes(\"T\")) {\n    departureHour = new Date(depStr).getHours();\n  }\n\n  // Rank Bucket = ceil(SRP Rank / 5)\n  const rankBucket = Math.ceil(row[\"SRP Rank\"] / 5);\n\n  // Similarity Group = RouteNumber_BusType_DepartureHour_RankBucket\n  const simGroup = [\n    String(row[\"Route Number\"]).trim(),\n    String(row[\"Bus Type\"]).trim(),\n    departureHour,\n    rankBucket\n  ].join(\"_\");\n\n  return {\n    json: {\n      ...row,\n      \"Load Factor\":      loadFactor,\n      \"Departure Hour\":   departureHour,\n      \"Rank Bucket\":      rankBucket,\n      \"Similarity Group\": simGroup\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "node-05",
+      "name": "Is Flixbus?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 380],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-flixbus",
+              "leftValue": "={{ $json[\"Operator\"] }}",
+              "rightValue": "flixbus",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true
+      }
+    },
+    {
+      "id": "node-06",
+      "name": "Aggregate Competitors",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 500],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Group competitor buses by Similarity Group\n// and calculate average Weighted Average Price per group\n\nconst groups = {};\n\nfor (const item of items) {\n  const sg    = item.json[\"Similarity Group\"];\n  const price = parseFloat(item.json[\"Weighted Average Price\"]);\n  if (!sg || isNaN(price)) continue;\n\n  if (!groups[sg]) {\n    groups[sg] = { total: 0, count: 0 };\n  }\n  groups[sg].total += price;\n  groups[sg].count += 1;\n}\n\nreturn Object.entries(groups).map(([sg, data]) => ({\n  json: {\n    \"Similarity Group\":    sg,\n    \"Competitor Avg Price\": parseFloat((data.total / data.count).toFixed(2)),\n    \"Competitor Count\":    data.count\n  }\n}));"
+      }
+    },
+    {
+      "id": "node-07",
+      "name": "Merge with Competitors",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1560, 380],
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByFields",
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "Similarity Group",
+              "field2": "Similarity Group"
+            }
+          ]
+        },
+        "joinMode": "enrichInput1",
+        "outputDataFrom": "input1",
+        "options": {}
+      }
+    },
+    {
+      "id": "node-08",
+      "name": "Calculate Price Diff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 380],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return items.map(item => {\n  const row      = item.json;\n  const ourPrice = parseFloat(row[\"Weighted Average Price\"]) || 0;\n  const compAvg  = (row[\"Competitor Avg Price\"] !== undefined && row[\"Competitor Avg Price\"] !== null)\n    ? parseFloat(row[\"Competitor Avg Price\"])\n    : null;\n\n  let priceDiff    = null;\n  let priceDiffPct = null;\n\n  if (compAvg !== null && !isNaN(compAvg) && compAvg > 0) {\n    priceDiff    = parseFloat((ourPrice - compAvg).toFixed(2));\n    priceDiffPct = parseFloat(((priceDiff / compAvg) * 100).toFixed(2));\n  }\n\n  return {\n    json: {\n      ...row,\n      \"Price Difference\":   priceDiff,\n      \"Price Difference %\": priceDiffPct\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "node-09",
+      "name": "Apply Flag Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 380],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return items.map(item => {\n  const row = item.json;\n  const pct = row[\"Price Difference %\"];\n\n  let flag = \"No Competitor Data\";\n\n  if (pct !== null && pct !== undefined) {\n    if      (pct >  10)  flag = \"Too Expensive\";\n    else if (pct < -10)  flag = \"Too Cheap\";\n    else                  flag = \"OK\";\n  }\n\n  return {\n    json: {\n      ...row,\n      \"Flag\":     flag,\n      \"Run Date\": new Date().toISOString().split(\"T\")[0]\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "node-10",
+      "name": "Store to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.2,
+      "position": [2220, 380],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Price Flags",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "node-11",
+      "name": "Filter Alerts",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2440, 380],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-not-ok",
+              "leftValue": "={{ $json[\"Flag\"] }}",
+              "rightValue": "OK",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            },
+            {
+              "id": "cond-not-nodata",
+              "leftValue": "={{ $json[\"Flag\"] }}",
+              "rightValue": "No Competitor Data",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true
+      }
+    },
+    {
+      "id": "node-12",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2660, 280],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": {
+          "__rl": true,
+          "value": "#price-alerts",
+          "mode": "name"
+        },
+        "text": "=🚌 *Price Alert — {{ $json[\"Flag\"] }}*\n\n• *Route:*        `{{ $json[\"Route Number\"] }}`\n• *Bus Type:*     {{ $json[\"Bus Type\"] }}\n• *Departure:*    {{ $json[\"Departure Time\"] }}\n• *Our Price:*    €{{ $json[\"Weighted Average Price\"] }}\n• *Comp Avg:*     €{{ $json[\"Competitor Avg Price\"] }}\n• *Diff %:*       {{ $json[\"Price Difference %\"] }}%\n• *SRP Rank:*     {{ $json[\"SRP Rank\"] }}\n• *Load Factor:*  {{ $json[\"Load Factor\"] }}\n• *Sim Group:*    `{{ $json[\"Similarity Group\"] }}`\n• *Date:*         {{ $json[\"Run Date\"] }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily Cron": {
+      "main": [
+        [
+          { "node": "Fetch Sheet Data", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Sheet Data": {
+      "main": [
+        [
+          { "node": "Clean Data", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Clean Data": {
+      "main": [
+        [
+          { "node": "Derive Fields", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Derive Fields": {
+      "main": [
+        [
+          { "node": "Is Flixbus?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Is Flixbus?": {
+      "main": [
+        [
+          { "node": "Merge with Competitors", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Aggregate Competitors", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Aggregate Competitors": {
+      "main": [
+        [
+          { "node": "Merge with Competitors", "type": "main", "index": 1 }
+        ]
+      ]
+    },
+    "Merge with Competitors": {
+      "main": [
+        [
+          { "node": "Calculate Price Diff", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Calculate Price Diff": {
+      "main": [
+        [
+          { "node": "Apply Flag Logic", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Apply Flag Logic": {
+      "main": [
+        [
+          { "node": "Store to Google Sheets", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Store to Google Sheets": {
+      "main": [
+        [
+          { "node": "Filter Alerts", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Filter Alerts": {
+      "main": [
+        [
+          { "node": "Send Slack Alert", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    { "name": "price-intelligence" },
+    { "name": "flixbus" },
+    { "name": "daily" }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "flixbus-price-intelligence-v1"
+  }
+}
